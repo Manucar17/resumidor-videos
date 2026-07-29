@@ -2,105 +2,105 @@ import os
 import tempfile
 import time
 import streamlit as st
-from google import genai
+import google.generativeai as genai
 
-# Configuración limpia e intuitiva
-st.set_page_config(page_title="Resumidor de Vídeos", page_icon="🎬", layout="centered")
+# Configuración visual de la aplicación
+st.set_page_config(page_title="Resumidor de Videos y Audio", page_icon="🎬")
 
-st.title("🎬 Resumidor de Vídeos y Audio")
+st.title("🎬 Resumidor de Videos y Audio")
 st.write("Sube un vídeo o audio y obtén un resumen automático claro y detallado.")
 
-# Cargar la API Key desde los Secrets
-api_key = st.secrets.get("GEMINI_API_KEY")
+# Configuración de la clave de API (obtenida de secretos o de variable de entorno)
+API_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
 
-if not api_key:
-    st.error("Error: No se ha configurado la clave API de Gemini en Secrets.")
-    st.stop()
+if not API_KEY:
+    API_KEY = st.sidebar.text_input("Introduce tu Gemini API Key:", type="password")
 
-client = genai.Client(api_key=api_key)
+if API_KEY:
+    genai.configure(api_key=API_KEY)
 
-# Lista priorizada de modelos oficiales estándar con cuota gratuita para vídeo
-MODEL_PRIORITY = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash"
-]
 
-uploaded_file = st.file_uploader(
+def obtener_ultimo_modelo_flash():
+    """Consulta directamente a la API de Google qué modelos están activos
+
+    y selecciona automáticamente el modelo Flash más reciente.
+    """
+    try:
+        modelos = [
+            m.name
+            for m in genai.list_models()
+            if "generateContent" in m.supported_generation_methods
+        ]
+        # Filtramos los modelos de tipo 'flash'
+        modelos_flash = [m for m in modelos if "flash" in m.lower()]
+
+        if modelos_flash:
+            # Devuelve el modelo más reciente disponible sin el prefijo 'models/'
+            return modelos_flash[0].replace("models/", "")
+        return modelos[0].replace("models/", "")
+    except Exception as e:
+        # Modelo por defecto si hay algún problema de red al listar
+        return "gemini-2.5-flash"
+
+
+# 1. Selector de archivo
+archivo = st.file_uploader(
     "1. Selecciona tu archivo de vídeo o audio",
-    type=["mp4", "mov", "avi", "mkv", "mp3", "m4a", "wav"],
+    type=["mp3", "wav", "mp4", "mkv", "mov", "avi"],
 )
 
-if uploaded_file is not None:
-    st.info(f"📁 Archivo preparado: **{uploaded_file.name}**")
+if archivo:
+    st.info(f"📂 Archivo preparado: **{archivo.name}**")
 
-    if st.button("🚀 Generar Resumen", type="primary", use_container_width=True):
-        try:
-            with st.spinner("⏳ Analizando el contenido... Esto puede tardar un par de minutos."):
-                file_ext = os.path.splitext(uploaded_file.name)[1]
-                with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
-                    tmp_file.write(uploaded_file.read())
+    # Botón principal
+    if st.button("🚀 Generar Resumen"):
+        if not API_KEY:
+            st.error("Por favor, introduce tu API Key para continuar.")
+        else:
+            # Paso A: Obtener el modelo activo más reciente sin listas fijas
+            with st.spinner("Conectando con Google API para detectar el modelo activo..."):
+                modelo_activo = obtener_ultimo_modelo_flash()
+
+            st.write(f"⚙️ Procesando con modelo: `{modelo_activo}`")
+
+            try:
+                # Paso B: Guardar temporalmente el archivo subido para enviarlo a la API
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=os.path.splitext(archivo.name)[1]
+                ) as tmp_file:
+                    tmp_file.write(archivo.getvalue())
                     tmp_path = tmp_file.name
 
-                # Subida de archivo a la API de Google
-                uploaded_media = client.files.upload(file=tmp_path)
+                # Paso C: Subir el archivo multimedia a Google Gemini
+                with st.spinner("Subiendo archivo multimedia a los servidores de Gemini..."):
+                    archivo_gemini = genai.upload_file(path=tmp_path)
 
-                while uploaded_media.state.name == "PROCESSING":
-                    time.sleep(4)
-                    uploaded_media = client.files.get(name=uploaded_media.name)
+                # Esperar a que el archivo termine de procesarse en Google (especialmente para vídeos grandes)
+                with st.spinner("Esperando a que Gemini procese el archivo de vídeo/audio..."):
+                    while archivo_gemini.state.name == "PROCESSING":
+                        time.sleep(2)
+                        archivo_gemini = genai.get_file(archivo_gemini.name)
 
-                if uploaded_media.state.name == "FAILED":
-                    raise Exception("Fallo en el procesamiento del vídeo.")
+                    if archivo_gemini.state.name == "FAILED":
+                        raise ValueError("Google no pudo procesar el archivo multimedia.")
 
-                prompt = """
-                Analiza el contenido audiovisual adjunto y genera un informe estructurado, detallado y claro en español:
+                # Paso D: Generar el resumen con el modelo detectado
+                with st.spinner("Generando el resumen automático..."):
+                    model = genai.GenerativeModel(model_name=modelo_activo)
+                    prompt = (
+                        "Haz un resumen detallado, estructurado y claro del contenido "
+                        "de este archivo multimedia. Destaca los puntos clave e ideas principales."
+                    )
+                    respuesta = model.generate_content([archivo_gemini, prompt])
 
-                # 📌 Resumen General
-                Explicación clara y comprensible del tema principal del vídeo en 2 o 3 párrafos.
+                # Mostrar resultado
+                st.success("¡Resumen generado con éxito!")
+                st.markdown("---")
+                st.write(respuesta.text)
 
-                # 💡 Puntos Clave
-                Listado ordenado con las ideas, explicaciones y conceptos más importantes.
-
-                # 📝 Anotaciones y Detalles
-                Fechas, nombres, decisiones tomadas, datos cuantitativos o tareas mencionadas en el vídeo.
-                """
-
-                response = None
-                last_error = None
-
-                # Probar secuencialmente los modelos estándar de la lista
-                for model_name in MODEL_PRIORITY:
-                    try:
-                        st.caption(f"🤖 Procesando con modelo: `{model_name}`")
-                        response = client.models.generate_content(
-                            model=model_name, 
-                            contents=[uploaded_media, prompt]
-                        )
-                        if response:
-                            break
-                    except Exception as e:
-                        last_error = e
-                        st.warning(f"⚠️ El modelo `{model_name}` no respondió. Probando alternativa...")
-                        continue
-
-                if not response:
-                    raise last_error
-
-                # Limpieza de archivos en el servidor
-                client.files.delete(name=uploaded_media.name)
+                # Limpieza del archivo subido en la nube y local
+                genai.delete_file(archivo_gemini.name)
                 os.remove(tmp_path)
 
-            st.success("✨ ¡Resumen completado con éxito!")
-            st.markdown("---")
-            st.markdown(response.text)
-
-            st.download_button(
-                label="📥 Descargar resumen en un archivo de texto (.txt)",
-                data=response.text,
-                file_name=f"Resumen_{uploaded_file.name}.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
-
-        except Exception as e:
-            st.error(f"Ocurrió un problema al procesar el archivo: {e}")
+            except Exception as e:
+                st.error(f"Ocurrió un problema al procesar el archivo: {e}")
