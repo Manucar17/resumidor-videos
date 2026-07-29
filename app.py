@@ -22,28 +22,28 @@ if api_key:
     genai.configure(api_key=api_key)
 
 
-def obtener_modelos_activos():
-    """Consulta en tiempo real a Google qué modelos existen y están activos.
-
-    Evita poner modelos antiguos a fuego en el código.
-    """
+def obtener_mejor_modelo():
+    """Selecciona el modelo multimodal principal activo evitando modelos incompatibles."""
     try:
-        modelos = []
+        modelos_validos = []
         for m in genai.list_models():
             if "generateContent" in m.supported_generation_methods:
-                # Quitamos el prefijo 'models/'
                 nombre = m.name.replace("models/", "")
-                modelos.append(nombre)
+                # Excluir modelos específicos de voz (TTS), imagen pura o pruebas
+                if not any(
+                    x in nombre.lower()
+                    for x in ["tts", "image", "embedding", "realtime"]
+                ):
+                    modelos_validos.append(nombre)
 
-        # Filtramos preferiblemente los modelos 'flash'
-        modelos_flash = [m for m in modelos if "flash" in m.lower()]
+        # Priorizar modelos flash estándar
+        for m in modelos_validos:
+            if "flash" in m and "lite" not in m:
+                return m
 
-        if modelos_flash:
-            return modelos_flash
-        return modelos if modelos else ["gemini-1.5-flash"]
+        return modelos_validos[0] if modelos_validos else "gemini-1.5-flash"
     except Exception:
-        # Fallback de seguridad
-        return ["gemini-1.5-flash"]
+        return "gemini-1.5-flash"
 
 
 # 1. Selector de archivo
@@ -60,15 +60,16 @@ if archivo_subido:
             st.error("Por favor, configura tu API Key de Gemini para continuar.")
             st.stop()
 
-        # Obtenemos automáticamente los modelos que Google tiene activos HOY
-        modelos_disponibles = obtener_modelos_activos()
-        exito = False
+        # Seleccionar el mejor modelo activo
+        modelo_activo = obtener_mejor_modelo()
+        st.write(f"⚙️ Procesando con el modelo: `{modelo_activo}`")
 
-        for modelo in modelos_disponibles:
-            st.write(f"⚙️ Procesando con modelo: `{modelo}`")
+        tmp_path = None
+        archivo_gemini = None
 
-            try:
-                # Guardar archivo temporalmente
+        try:
+            # 1. Guardar archivo temporalmente
+            with st.spinner("Guardando archivo temporal..."):
                 extension = os.path.splitext(archivo_subido.name)[1]
                 with tempfile.NamedTemporaryFile(
                     delete=False, suffix=extension
@@ -76,53 +77,51 @@ if archivo_subido:
                     tmp.write(archivo_subido.getvalue())
                     tmp_path = tmp.name
 
-                # Subida a Gemini
-                with st.spinner("Subiendo archivo a los servidores de Google..."):
-                    archivo_gemini = genai.upload_file(path=tmp_path)
+            # 2. Subir archivo a Gemini (UNA SOLA VEZ)
+            with st.spinner(
+                "Subiendo vídeo a Google (esto puede tardar unos segundos con archivos grandes)..."
+            ):
+                archivo_gemini = genai.upload_file(path=tmp_path)
 
-                # Procesamiento multimedia en Google
-                with st.spinner(
-                    "Esperando el procesamiento del archivo multimedia..."
-                ):
-                    while archivo_gemini.state.name == "PROCESSING":
-                        time.sleep(2)
-                        archivo_gemini = genai.get_file(archivo_gemini.name)
+            # 3. Esperar el procesamiento en los servidores de Google
+            with st.spinner(
+                "Esperando a que los servidores de Google procesen el vídeo..."
+            ):
+                while archivo_gemini.state.name == "PROCESSING":
+                    time.sleep(3)
+                    archivo_gemini = genai.get_file(archivo_gemini.name)
 
-                    if archivo_gemini.state.name == "FAILED":
-                        raise ValueError(
-                            "Google no pudo procesar este archivo multimedia."
-                        )
+                if archivo_gemini.state.name == "FAILED":
+                    st.error("Google no pudo procesar este archivo multimedia.")
+                    st.stop()
 
-                # Generación del resumen
-                with st.spinner("Generando el resumen automático..."):
-                    model = genai.GenerativeModel(modelo)
-                    prompt = (
-                        "Haz un resumen detallado, estructurado y claro del contenido "
-                        "de este archivo. Destaca los puntos clave, temas principales y conclusiones."
-                    )
-                    respuesta = model.generate_content([archivo_gemini, prompt])
+            # 4. Generar el resumen
+            with st.spinner("Generando el resumen automático..."):
+                model = genai.GenerativeModel(modelo_activo)
+                prompt = (
+                    "Haz un resumen detallado, estructurado y claro del contenido "
+                    "de este archivo. Destaca los puntos clave, temas principales y conclusiones."
+                )
+                respuesta = model.generate_content([archivo_gemini, prompt])
 
-                # Mostrar resultado
-                st.success("¡Resumen generado con éxito!")
-                st.markdown("---")
-                st.write(respuesta.text)
+            # Mostrar resultado
+            st.success("¡Resumen generado con éxito!")
+            st.markdown("---")
+            st.write(respuesta.text)
 
-                # Limpieza de archivos temporales
+        except Exception as e:
+            # Muestra el error exacto si ocurre algún fallo con la API Key, cuota o archivo
+            st.error(f"❌ Error durante el proceso: {e}")
+
+        finally:
+            # Limpieza de archivos
+            if archivo_gemini:
                 try:
                     genai.delete_file(archivo_gemini.name)
+                except Exception:
+                    pass
+            if tmp_path and os.path.exists(tmp_path):
+                try:
                     os.remove(tmp_path)
                 except Exception:
                     pass
-
-                exito = True
-                break  # Si un modelo funciona, salimos del bucle
-
-            except Exception as e:
-                st.warning(
-                    f"El modelo `{modelo}` no respondió. Probando alternativa..."
-                )
-
-        if not exito:
-            st.error(
-                "Ocurrió un problema al procesar el archivo con los modelos disponibles."
-            )
